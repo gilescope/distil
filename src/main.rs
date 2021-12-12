@@ -1,8 +1,12 @@
-//#![feature(slice_group_by)]
+#![feature(slice_group_by)]
 //#![feature(drain_filter)]
+//#![feature(slice_pattern)]
+//use core::slice::SlicePattern;
 use emojis::Emoji;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::convert::TryInto;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 
@@ -13,76 +17,167 @@ fn main() {
     println!("{}", compress(lines.join("\n")));
 }
 
-// fn distil(input: &str, ledgend: &str) -> Vec<String> {
-//     const window_size: usize = 5;
-//     let mut freq = HashMap::<[u8; window_size], u32>::new();
-//     let inp = input.as_bytes().windows(window_size);
-//     let min_number = 4;
-//     let result = String::new();
+fn distil(input: &[u8], max_suggestions: usize) -> Vec<String> {
+    const WINDOW_SIZE: usize = 5;
+    let mut freq = HashMap::<[u8; WINDOW_SIZE], u32>::new();
+    let inp = input.windows(WINDOW_SIZE);
 
-//     for i in inp {
-//         let entry = freq.entry(i.try_into().unwrap()).or_insert(0);
-//         *entry += 1;
-//     }
+    for i in inp {
+        let entry = freq.entry(i.try_into().unwrap()).or_insert(0);
+        *entry += 1;
+    }
 
-//     let max = *freq.values().max().unwrap();
-//     // for (k, v) in freq {
-//     println!("max = {}", max);
-//     let mut seek: [u8; window_size] = *b"01234";
-//     for (k, v) in freq {
-//         if v == max {
-//             println!("max = {}", String::from_utf8_lossy(&k));
-//             seek = k;
-//             break;
-//         }
-//     }
+    let mut res = vec![];
 
-//     //grow k
+    for _ in 0..max_suggestions {
+        let max = freq.values().max().cloned();
+        if let Some(max) = max {
+            // reverse lookup: find max seed pattern.
+            let mut seek: [u8; WINDOW_SIZE] = *b"01234";
+            for (k, v) in &freq {
+                if *v == max {
+                    seek = *k;
+                    break;
+                }
+            }
+            freq.remove(&seek);
 
-//     let inp = input.as_bytes();
-//     let mut start_end = Vec::<(usize, usize)>::new();
-//     for i in 0..(inp.len() - window_size) {
-//         if inp[i..i + window_size] == seek {
-//             start_end.push((i, i + window_size));
-//         }
-//     }
-//     println!("occurances: {}", start_end.len());
-//     'outer: loop {
-//         // look at all next char
-//         let groups: Vec<u8> = start_end.iter().map(|(_, end)| inp[end + 1]).collect();
-//         //.sort()
+            let inp = input;
+            let mut starts = Vec::<usize>::new();
+            for i in 0..(inp.len() - WINDOW_SIZE) {
+                if inp[i..i + WINDOW_SIZE] == seek {
+                    starts.push(i);
+                }
+            }
 
-//         let mut changed = false;
-//         let mut ch = None;
-//         for group in groups.group_by(|x, y| x == y) {
-//             if group.len() > min_number {
-//                 ch = Some(group[0]);
-//                 for (s, e) in &mut start_end {
-//                     *e += 1;
-//                 }
-//                 changed = true;
-//                 println!("extended");
+            //TODO: if start INSIDE previous suggestion then continue!
 
-//                 break;
-//             }
-//         }
+            let grown = grow(WINDOW_SIZE, &starts, input);
 
-//         if !changed {
-//             break;
-//         }
+            if let Some((len, points)) = grown {
+                res.push(String::from_utf8_lossy(&input[points[0]..points[0] + len]).to_string())
+            }
+        } else {
+            break;
+        }
+    }
+    res
+}
 
-//         let ch = ch.unwrap();
+fn grow(current_len: usize, og_groups: &[usize], input: &[u8]) -> Option<(usize, Vec<usize>)> {
+    let res = grow_forwards(current_len, og_groups, input);
+    if let Some((len, groups)) = res {
+        grow_backwards(len, groups.as_slice(), input)
+    } else {
+        grow_backwards(current_len, og_groups, input)
+    }
+}
 
-//         //discard ones that don't match
-//         start_end.drain_filter(|(s, e)| inp[*e + 1] != ch);
-//     }
+/// Provide a larger
+/// current_len is the length of the common portion found so far.
+/// input is the haystack to look in to consider extending.
+/// groups is the indexs where the common lengths begin.
+fn grow_forwards(
+    current_len: usize,
+    og_groups: &[usize],
+    input: &[u8],
+) -> Option<(usize, Vec<usize>)> {
+    if og_groups.len() < 2 {
+        return None;
+    }
+    // check if we've hit the end of the input:
+    let last = og_groups[og_groups.len() - 1];
+    if last + current_len >= input.len() {
+        //At the moment instafail this but in reality we are truncating some results.
+        return None;
+    }
 
-//     let (s, e) = start_end[0];
-//     vec![String::from_utf8_lossy(&inp[s..e]).to_owned().to_string()]
-// }
+    // Sort
+    let mut group: Vec<_> = og_groups
+        .iter()
+        .map(|&i| (i, input[i + current_len]))
+        .collect();
+    group.sort_unstable_by_key(|(_, ch)| *ch);
+
+    let groups = group.group_by(|(_, cha), (_, chb)| cha == chb);
+
+    let mut best_len = current_len;
+    let mut groups_to_beat: Vec<usize> = og_groups.to_vec();
+    let mut vol_to_beat = best_len * groups_to_beat.len();
+
+    for idxs in groups {
+        let idxs: Vec<usize> = idxs.iter().map(|(i, _)| *i).collect();
+        if idxs.len() < 2 {
+            continue;
+        } //todo: overlaps???
+        let grewed = grow_forwards(current_len + 1, idxs.as_slice(), input);
+        if let Some((grewed, grew_groups)) = grewed {
+            let new_vol = grewed * grew_groups.len();
+            if new_vol > vol_to_beat {
+                vol_to_beat = new_vol;
+                best_len = grewed;
+                groups_to_beat = grew_groups;
+            }
+        }
+    }
+
+    Some((best_len, groups_to_beat))
+}
+
+/// assuming group indicies are sorted smallest to largests.
+fn grow_backwards(
+    current_len: usize,
+    og_groups: &[usize],
+    input: &[u8],
+) -> Option<(usize, Vec<usize>)> {
+    if og_groups.len() < 2 {
+        return None;
+    }
+    // check if we've hit the end of the input:
+    let first = og_groups[0];
+    if first == 0 {
+        //At the moment instafail this but in reality we are truncating some results.
+        return None;
+    }
+
+    // Sort
+    let mut group: Vec<_> = og_groups.iter().map(|&i| (i, input[i - 1])).collect();
+    group.sort_unstable_by_key(|(_, ch)| *ch);
+
+    let groups = group.group_by(|(_, cha), (_, chb)| cha == chb);
+
+    let mut best_len = current_len;
+    let mut groups_to_beat: Vec<usize> = og_groups.to_vec();
+    let mut vol_to_beat = best_len * groups_to_beat.len();
+
+    for idxs in groups {
+        let idxs: Vec<usize> = idxs.iter().map(|(i, _)| *i).collect();
+        if idxs.len() < 2 {
+            continue;
+        } //todo: overlaps???
+        let grewed = grow_backwards(
+            current_len + 1,
+            idxs.iter()
+                .map(|x| x - 1)
+                .collect::<Vec<usize>>()
+                .as_slice(),
+            input,
+        );
+        if let Some((grewed, grew_groups)) = grewed {
+            let new_vol = grewed * grew_groups.len();
+            if new_vol > vol_to_beat {
+                vol_to_beat = new_vol;
+                best_len = grewed;
+                groups_to_beat = grew_groups;
+            }
+        }
+    }
+
+    Some((best_len, groups_to_beat))
+}
 
 fn compress(a: String) -> String {
-    let mut results = String::from("\nwhere");
+    let mut results = String::new();
     let mut emojis_used = HashSet::new();
     let res = compress_aux(a, &mut results, &mut emojis_used);
     if emojis_used.is_empty() {
@@ -91,75 +186,49 @@ fn compress(a: String) -> String {
     return format!("{}\n where {}", res, &results);
 }
 
-fn compress_aux(a: String, out: &mut String, used: &mut HashSet<Emoji>) -> String {
-    if a.len() < 5 {
-        return a;
+fn compress_aux(input: String, out: &mut String, used: &mut HashSet<Emoji>) -> String {
+    if input.len() < 5 {
+        return input;
     }
-    let count = a.chars().count();
-    let (ch_idx, _chr) = a.char_indices().skip(count / 2).next().unwrap();
-    let (b, c) = a.split_at(ch_idx);
-    {
-        let mut m = String::new();
-        let it = MatchIterator::new(b.as_bytes(), c.as_bytes(), AlgoSpec::HashMatch(10));
-        for i in it {
-            if i.first_end() - i.first_pos > m.len() {
-                if let Ok(v) = std::str::from_utf8(&a.as_bytes()[i.first_pos..i.first_end()]) {
-                    if !v.contains('/') {
-                        //don't mess with paths
-                        m = v.to_string();
+
+    let it = distil(strip_ansi_escapes::strip(&input).unwrap().as_slice(), 40);
+    let mut res = input;
+    for i in it {
+        let m = i;
+        if !m.contains('/') && !m.contains('^') {
+            //don't mess with paths
+
+            if m.len() > 0 {
+                let mut replace = m.trim().to_string();
+                if replace.ends_with("::") {
+                    replace.pop();
+                    replace.pop();
+                }
+                replace = trim_bracket(&replace).trim().to_string();
+                const UNICODE_CHAR_LEN: usize = 4;
+                if replace.len() > UNICODE_CHAR_LEN {
+                    let emo = pick_subset(&replace, used);
+                    used.insert(emo.clone());
+                    //                    println!("replace '{}', '{}'", &replace, emo.as_str());
+
+                    let res_new = res.replace(&replace, emo.as_str());
+                    if res != res_new {
+                        out.push_str(&format!(
+                            "\n{} ({})\t= {}",
+                            emo.as_str(),
+                            emo.shortcode().unwrap(),
+                            replace
+                        ));
+                        res = res_new;
                     }
-                    break;
-                }
-            }
-        }
-        if m.len() > 0 {
-            let mut replace = m.trim().to_string();
-            if replace.ends_with("::") {
-                replace.pop();
-                replace.pop();
-            }
-            replace = trim_bracket(&replace).trim().to_string();
-            const UNICODE_CHAR_LEN: usize = 4;
-            if replace.len() > UNICODE_CHAR_LEN {
-                // let s = emojis::use emojis::Emoji;iter().count();
-                // println!("totoooasd {}", s);
-
-                // let mut hasher = DefaultHasher::new();
-                // replace.hash(&mut hasher);
-                // let emoji_num = (hasher.finish() % 100) as usize;
-                // let emo = emojis::iter()
-                //     .skip(emoji_num + 200)
-                //     .next()
-                //     .unwrap()
-                //     .as_str()
-                //     .chars()
-                //     .next()
-                //     .unwrap();
-
-                let emo = pick_subset(&replace, used);
-                used.insert(emo.clone());
-                // let emog = emo.as_str().chars().next().unwrap();
-                let replace = String::from_utf8_lossy(
-                    strip_ansi_escapes::strip(&replace).unwrap().as_slice(),
-                )
-                .to_string();
-                let mut res = a.replace(&replace, emo.as_str());
-                if res != a {
-                    out.push_str(&format!(
-                        "\n{} ({})\t= {}",
-                        emo.as_str(),
-                        emo.shortcode().unwrap(),
-                        replace
-                    ));
-                    res = compress_aux(res, out, used);
-                    return res;
                 }
             }
         }
     }
-    return a;
+    return res;
 }
 
+#[allow(dead_code)]
 fn pick_random(replace: &str) -> char {
     let mut hasher = DefaultHasher::new();
     replace.hash(&mut hasher);
@@ -175,6 +244,7 @@ fn pick_random(replace: &str) -> char {
     emo
 }
 
+#[allow(dead_code)]
 fn pick_distance(replace: &str) -> &'static Emoji {
     let (emo, _) = emojis::iter()
         .filter(|e| e.shortcode().is_some())
@@ -238,54 +308,18 @@ fn trim_bracket(big: &str) -> &str {
                 }
             }
         }
-        // if sign == -1 && count <= 0 {
-        //     return trim_bracket(&big[i + 1..]);
-        // }
-        // if sign == -1 && count == 1 {
-        //     return &big[..i + 1];
-        // }
-        //        count += sign;
     }
 
     if max_closure_span.1 - max_closure_span.0 > 0 {
         return &big[max_closure_span.0..max_closure_span.1];
     }
 
-    //    if count == 0 {
-    //        return big;
-    // } else if count < 0 {
-    //     // Too many closing brackets
-    //     let mut idx = big.len() - 1;
-    //     while count < 0 && idx >= 0 {
-    //         if big.as_bytes()[idx] == b'>' {
-    //             count += 1;
-    //             if count == 0 {
-    //                 //maybe we should go back one more excluding
-    //                 return &big[..idx];
-    //             }
-    //         }
-    //         idx -= 1;
-    //     }
-    // } else {
-    //     // too many opening brackets
-    //     let mut idx = 0;
-    //     while count > 0 && idx < big.len() {
-    //         if big.as_bytes()[idx] == b'<' {
-    //             count -= 1;
-    //             if count == 0 {
-    //                 //maybe we should go back one more excluding
-    //                 return &big[idx..];
-    //             }
-    //         }
-    //         idx += 1;
-    //     }
-    // }
     return big;
 }
 
-use bcmp::{AlgoSpec, MatchIterator};
+//use bcmp::{AlgoSpec, MatchIterator};
 #[test]
-fn test() {
+fn test_real() {
     //     // error[E0277]: the trait bound `RuntimeApiImpl<sp_runtime::generic::Block<sp_runtime::generic::Header<u32, BlakeTwo256>, OpaqueExtrinsic>, sc_service::client::Client<substrate_test_client::Backend<sp_runtime::generic::Block<sp_runtime::generic::Header<u32, BlakeTwo256>, OpaqueExtrinsic>>, LocalCallExecutor<sp_runtime::generic::Block<sp_runtime::generic::Header<u32, BlakeTwo256>, OpaqueExtrinsic>, substrate_test_client::Backend<sp_runtime::generic::Block<sp_runtime::generic::Header<u32, BlakeTwo256>, OpaqueExtrinsic>>, NativeElseWasmExecutor<RuntimeExecutor>>, sp_runtime::generic::Block<sp_runtime::generic::Header<u32, BlakeTwo256>, OpaqueExtrinsic>, cumulus_test_runtime::RuntimeApi>>: GrandpaApi<sp_runtime::generic::Block<sp_runtime::generic::Header<u32, BlakeTwo256>, OpaqueExtrinsic>>` is not satisfied
     //   --> test/service/src/lib.rs:175:16
     //     |
@@ -338,7 +372,7 @@ warning: unused import: `sp_api::BlockT`
 For more information about this error, try `rustc --explain E0277`.    
     // "#;
 
-    let (b, c) = a.split_at(a.len() / 2);
+    //    let (b, c) = a.split_at(a.len() / 2);
 
     //let it = MatchIterator::new(b.as_bytes(), c.as_bytes(), AlgoSpec::HashMatch(10));
     //for m in it {
@@ -372,4 +406,37 @@ fn test_trim_leading() {
 fn finds_biggest_closure() {
     let s = r#"<Backend<sp_runtime> Block<BiggggOpaqueExtrinsic<small>>"#;
     assert_eq!(trim_bracket(s), "BiggggOpaqueExtrinsic<small>")
+}
+
+#[test]
+fn ok_her() {
+    let s = include_str!("/Users/bit/p/substrate/test-utils/runtime/my.txt");
+    let y = compress(s.to_string());
+    println!("{}", y);
+}
+
+#[test]
+fn grpw_it_forwards() {
+    //hit end
+    assert_eq!(grow_forwards(2, &[0, 3], b"abcabc"), Some((2, vec![0, 3])));
+
+    assert_eq!(grow_forwards(2, &[0, 3], b"abcabcX"), Some((3, vec![0, 3])));
+
+    assert_eq!(
+        grow_forwards(2, &[0, 3, 6], b"abcabcabcX"),
+        Some((3, vec![0, 3, 6]))
+    );
+}
+
+#[test]
+fn grpw_it_backwards() {
+    assert_eq!(
+        grow_backwards(1, &[3, 6], b" abcabc"),
+        Some((3, vec![1, 4]))
+    );
+}
+
+#[test]
+fn grow_it() {
+    assert_eq!(grow(1, &[2, 6], b" abc abc "), Some((3, vec![1, 5])));
 }
